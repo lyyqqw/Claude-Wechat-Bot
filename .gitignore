@@ -12,3 +12,6 @@ dist/
 .playwright-mcp/
 dashboard-test-2.png
 debug-cdn.js
+
+CLAUDE.md
+AGENTS.md
