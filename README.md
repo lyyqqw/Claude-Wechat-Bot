@@ -2,7 +2,7 @@
 
 **English** | [中文](README.zh.md)
 
-Bridge your WeChat personal account to Claude AI via Tencent's iLink Bot API. Users message a WeChat bot, which forwards requests to the Claude Agent SDK and sends replies back.
+Bridge your WeChat personal account to Claude Code via Tencent's iLink Bot API. Users message a WeChat bot, which forwards requests to the Claude Agent SDK and sends replies back.
 
 ## Features
 

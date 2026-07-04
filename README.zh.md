@@ -2,7 +2,7 @@
 
  [English](README.md) | **中文**
 
- 通过腾讯 iLink Bot API 将你的微信个人账号接入 Claude AI。用户向微信机器人发送消息，机器人将请求转发给 Claude Agent SDK 并回复。
+ 通过腾讯 iLink Bot API 将你的微信个人账号接入 Claude Code。用户向微信机器人发送消息，机器人将请求转发给 Claude Agent SDK 并回复。
 
  ## 功能特性
 
