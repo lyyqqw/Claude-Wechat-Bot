@@ -1,0 +1,38 @@
+{
+  "name": "claude-code-wechat-bot",
+  "version": "2.4.1",
+  "description": "将 Claude Code 接入微信个人号 — 基于 Claude Agent SDK + 腾讯 iLink Bot API",
+  "type": "module",
+  "bin": {
+    "claude-wechat": "./src/index.js"
+  },
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node src/index.js",
+    "login": "node src/auth.js",
+    "add-bot": "node src/auth.js",
+    "panel:install": "cd panel-ui && npm install",
+    "panel:build": "cd panel-ui && npm run build",
+    "panel:dev": "cd panel-ui && npm run dev",
+    "setup": "npm run panel:install && npm run panel:build"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.185",
+    "@xmccln/wechat-ilink-sdk": "^1.0.4",
+    "chalk": "^5.4.1",
+    "cors": "^2.8.6",
+    "dotenv": "^16.4.7",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "playwright": "^1.61.1",
+    "puppeteer-core": "^25.3.0",
+    "qrcode": "^1.5.4"
+  }
+}

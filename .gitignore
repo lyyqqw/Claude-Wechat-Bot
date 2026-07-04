@@ -1,0 +1,14 @@
+node_modules/
+sessions/
+config.json
+qrcode.png
+*.tgz
+.env
+panel-ui/dist/
+dist/
+*.log
+.claude/
+.codex/
+.playwright-mcp/
+dashboard-test-2.png
+debug-cdn.js

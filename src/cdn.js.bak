@@ -1,0 +1,516 @@
+﻿/**
+ * 微信 CDN 媒体文件处理
+ *
+ * 腾讯 iLink 协议中，所有图片/文件/语音均通过 CDN 传输，
+ * 并使用 AES-128-ECB 加密存储。
+ *
+ * 传输流程:
+ *   1. 生成随机 AES-128 密钥
+ *   2. 使用 AES-128-ECB + PKCS7 填充加密文件
+ *   3. 调用 getUploadUrl 获取 CDN 预签名上传地址
+ *   4. PUT 加密数据到 CDN
+ *   5. 将 aes_key + CDN 引用加入 sendMessage
+ *
+ * CDN 域名: https://novac2c.cdn.weixin.qq.com/c2c
+ */
+import crypto from 'node:crypto';
+import https from 'node:https';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import chalk from 'chalk';
+
+// 从 ilink 引入 API 调用函数（运行时按需导入，避免启动时强制校验 token）
+let _ilink;
+async function getIlink() {
+  if (!_ilink) _ilink = await import('./ilink.js');
+  return _ilink;
+}
+
+/**
+ * AES-128-ECB 加密（PKCS7 填充）
+ *
+ * @param {Buffer} plaintext - 明文数据
+ * @param {Buffer} key - 16 字节 AES-128 密钥
+ * @returns {Buffer} 密文
+ */
+export function encryptAES128ECB(plaintext, key) {
+  const cipher = crypto.createCipheriv('aes-128-ecb', key, null);
+  return Buffer.concat([cipher.update(plaintext), cipher.final()]);
+}
+
+/**
+ * AES-128-ECB 解密（PKCS7 填充）
+ *
+ * @param {Buffer} ciphertext - 密文数据
+ * @param {Buffer} key - 16 字节 AES-128 密钥
+ * @returns {Buffer} 明文
+ */
+export function decryptAES128ECB(ciphertext, key) {
+  const decipher = crypto.createDecipheriv('aes-128-ecb', key, null);
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+}
+
+/**
+ * 生成随机 AES-128 密钥
+ *
+ * @returns {{ key: Buffer, keyB64: string }}
+ */
+export function generateAES128Key() {
+  const key = crypto.randomBytes(16);
+  return { key, keyB64: key.toString('base64') };
+}
+
+/**
+ * 加密文件并准备上传参数
+ *
+ * @param {Buffer} fileData - 文件二进制数据
+ * @returns {{ ciphertext: Buffer, aesKey: string, plaintextSize: number, ciphertextSize: number }}
+ */
+export function prepareFileUpload(fileData) {
+  const { key, keyB64 } = generateAES128Key();
+  const ciphertext = encryptAES128ECB(fileData, key);
+
+  return {
+    ciphertext,
+    aesKey: keyB64,
+    plaintextSize: fileData.length,
+    ciphertextSize: ciphertext.length,
+  };
+}
+
+/**
+ * 解密从 CDN 下载的文件
+ *
+ * @param {Buffer} ciphertext - CDN 下载的密文
+ * @param {string} aesKeyB64 - Base64 编码的 AES-128 密钥
+ * @returns {Buffer} 解密后的明文
+ */
+export function decryptFileFromCDN(ciphertext, aesKeyB64) {
+  const decoded = Buffer.from(aesKeyB64, 'base64');
+
+  // 新格式: aes_key = base64(hex_string) → 解码后 32 字节 ASCII hex
+  let key;
+  if (decoded.length === 32 && /^[0-9a-fA-F]{32}$/.test(decoded.toString('ascii'))) {
+    key = Buffer.from(decoded.toString('ascii'), 'hex');
+  } else if (decoded.length === 16) {
+    // 旧格式: aes_key = base64(raw_key)
+    key = decoded;
+  } else {
+    throw new Error(`AES key length unexpected: ${decoded.length} bytes`);
+  }
+
+  const decipher = crypto.createDecipheriv('aes-128-ecb', key, null);
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+}
+
+/**
+ * 上传加密文件到微信 CDN
+ *
+ * @param {object} uploadParams - from getUploadUrl()
+ * @param {Buffer} ciphertext - 加密后的文件数据
+ * @param {object} [options]
+ * @param {string} [options.fileKey]
+ * @param {AbortSignal} [options.signal]
+ * @returns {Promise<string>} x-encrypted-param
+ */
+export async function uploadToCDN(uploadParams, ciphertext, options = {}) {
+  const cdnUrl = buildUploadUrl(uploadParams, options.fileKey);
+
+  return new Promise((resolve, reject) => {
+    const url = new URL(cdnUrl);
+    const req = https.request({
+      hostname: url.hostname,
+      path: url.pathname + url.search,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': ciphertext.length,
+        'Accept-Encoding': 'identity',
+        'User-Agent': 'Python-urllib/3.11',
+      },
+      timeout: 30000,
+    }, (res) => {
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
+      res.on('end', () => {
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          const body = Buffer.concat(chunks).toString('utf-8').slice(0, 500);
+          console.error(chalk.dim(`  ${chalk.dim('│')}   CDN response [${res.statusCode}]: ${body}`));
+          return reject(new Error(`CDN upload failed: HTTP ${res.statusCode} — ${body.slice(0, 200)}`));
+        }
+        const param = res.headers['x-encrypted-param'];
+        if (!param) {
+          return reject(new Error('CDN response missing x-encrypted-param header'));
+        }
+        resolve(param);
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('CDN upload timed out'));
+    });
+    if (options.signal) {
+      if (options.signal.aborted) {
+        req.destroy();
+        reject(new Error('CDN upload aborted'));
+        return;
+      }
+      options.signal.addEventListener('abort', () => {
+        req.destroy();
+        reject(new Error('CDN upload aborted'));
+      }, { once: true });
+    }
+    req.end(ciphertext);
+  });
+}
+
+function buildUploadUrl(uploadParams, fileKey) {
+  if (uploadParams.upload_full_url) {
+    return uploadParams.upload_full_url;
+  }
+  if (!uploadParams.upload_param) {
+    throw new Error(`getUploadUrl missing upload url: ${JSON.stringify(uploadParams).slice(0, 200)}`);
+  }
+  if (!fileKey) {
+    throw new Error('CDN upload fileKey missing');
+  }
+
+  // upload_param 是服务端签好的不透明参数，不能转换 base64/base64url 或改写填充。
+  const query = new URLSearchParams({
+    encrypted_query_param: uploadParams.upload_param,
+    filekey: fileKey,
+  });
+  return `https://novac2c.cdn.weixin.qq.com/c2c/upload?${query.toString()}`;
+}
+
+/**
+ * 从微信 CDN 下载加密文件
+ *
+ * @param {string} cdnKey - CDN 文件 key
+ * @param {object} [options]
+ * @param {AbortSignal} [options.signal]
+ * @returns {Promise<Buffer>} 加密后的文件数据（需用 aes_key 解密）
+ */
+async function uploadEncryptedToCDN(ciphertext, uploadParam, fileKey, options = {}) {
+  const query = new URLSearchParams({
+    encrypted_query_param: uploadParam,
+    filekey: fileKey,
+  }).toString();
+  const url = `https://novac2c.cdn.weixin.qq.com/c2c/upload?${query}`;
+
+  console.log(chalk.dim(`  ${chalk.dim('│')}   CDN URL (${url.length} chars): ${url}`));
+
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body: ciphertext,
+    signal: options.signal,
+  });
+
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => '');
+    console.error(chalk.dim(`  ${chalk.dim('│')}   CDN response [${resp.status}]: ${body.slice(0, 500)}`));
+    throw new Error(`CDN upload failed: HTTP ${resp.status} — ${body.slice(0, 200)}`);
+  }
+
+  const downloadParam = resp.headers.get('x-encrypted-param');
+  if (!downloadParam) {
+    throw new Error('CDN response missing x-encrypted-param header');
+  }
+  return downloadParam;
+}
+
+export async function downloadFromCDN(cdnKey, options = {}) {
+  const CDN_BASE = 'https://novac2c.cdn.weixin.qq.com/c2c';
+  let url;
+
+  if (typeof cdnKey === 'string' && cdnKey.length > 64) {
+    // 新格式: encrypted_query_param → /c2c/download?encrypted_query_param=...
+    url = `${CDN_BASE}/download?encrypted_query_param=${encodeURIComponent(cdnKey)}`;
+  } else if (typeof cdnKey === 'string') {
+    // 旧格式: cdn_key 短路径
+    url = `${CDN_BASE}/${cdnKey}`;
+  } else if (cdnKey?.fullUrl) {
+    // 直接传 full_url
+    url = cdnKey.fullUrl;
+  } else {
+    throw new Error('downloadFromCDN: invalid args');
+  }
+
+  const resp = await fetch(url, {
+    method: 'GET',
+    signal: options.signal,
+  });
+
+  if (!resp.ok) {
+    throw new Error(`CDN 下载失败: HTTP ${resp.status} — ${url.slice(0, 100)}`);
+  }
+
+  const buffer = await resp.arrayBuffer();
+  return Buffer.from(buffer);
+}
+
+/**
+ * 处理收到的图片消息：下载并解密
+ *
+ * 兼容两种格式：
+ *   - 旧格式: image_item = { cdn_key, aes_key, ... }
+ *   - 新格式: image_item = { media: { encrypt_query_param, aes_key, ... }, ... }
+ *
+ * @param {object} imageItem - 消息中的 image_item
+ * @param {object} [options]
+ * @param {AbortSignal} [options.signal]
+ * @returns {Promise<Buffer>} 解密后的图片数据
+ */
+export async function processIncomingImage(imageItem, options = {}) {
+  const item = imageItem.media || imageItem;
+  const cdnKey = item.cdn_key || item.encrypt_query_param;
+  const aesKey = item.aes_key;
+  if (!cdnKey || !aesKey) {
+    throw new Error(`图片 CDN 数据不完整: keys=[${Object.keys(imageItem).join(',')}] mediaKeys=[${Object.keys(imageItem.media || {}).join(',')}]`);
+  }
+
+  const encrypted = await downloadFromCDN(cdnKey, options);
+  return decryptFileFromCDN(encrypted, aesKey);
+}
+
+/**
+ * 生成文件 MD5（用于 CDN 上传验证）
+ *
+ * @param {Buffer} data
+ * @returns {string} hex MD5
+ */
+export function fileMD5(data) {
+  return crypto.createHash('md5').update(data).digest('hex');
+}
+
+// ---- 图片尺寸检测（纯 Buffer 解析，无外部依赖） ----
+
+const IMAGE_EXT = new Set(['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']);
+export function isImageFile(filePath) {
+  return IMAGE_EXT.has(path.extname(filePath).toLowerCase());
+}
+
+const VIDEO_EXT = new Set(['.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp', '.flv', '.wmv']);
+export function isVideoFile(filePath) {
+  return VIDEO_EXT.has(path.extname(filePath).toLowerCase());
+}
+
+const OUTGOING_MEDIA_KINDS = {
+  image: {
+    label: 'image',
+    mediaType: 1,
+    itemType: 2,
+    itemKey: 'image_item',
+    noNeedThumb: true,
+    isImage: true,
+    isVideo: false,
+  },
+  video: {
+    label: 'video',
+    mediaType: 2,
+    itemType: 5,
+    itemKey: 'video_item',
+    noNeedThumb: true,
+    isImage: false,
+    isVideo: true,
+  },
+  file: {
+    label: 'file',
+    mediaType: 3,
+    itemType: 4,
+    itemKey: 'file_item',
+    noNeedThumb: false,
+    isImage: false,
+    isVideo: false,
+  },
+};
+
+function detectOutgoingMediaKind(filePath) {
+  if (isImageFile(filePath)) return OUTGOING_MEDIA_KINDS.image;
+  if (isVideoFile(filePath)) return OUTGOING_MEDIA_KINDS.video;
+  return OUTGOING_MEDIA_KINDS.file;
+}
+
+export function getImageSize(buffer) {
+  // PNG
+  if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47) {
+    return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
+  }
+  // JPEG
+  if (buffer[0] === 0xFF && buffer[1] === 0xD8) {
+    let offset = 2;
+    while (offset + 8 < buffer.length) {
+      if (buffer[offset] !== 0xFF) break;
+      const marker = buffer[offset + 1];
+      if (marker === 0xC0 || marker === 0xC1 || marker === 0xC2) {
+        return { width: buffer.readUInt16BE(offset + 7), height: buffer.readUInt16BE(offset + 5) };
+      }
+      const segLen = buffer.readUInt16BE(offset + 2);
+      offset += 2 + segLen;
+    }
+  }
+  // GIF
+  if (buffer[0] === 0x47 && buffer[1] === 0x49 && buffer[2] === 0x46) {
+    return { width: buffer.readUInt16LE(6), height: buffer.readUInt16LE(8) };
+  }
+  return { width: 0, height: 0 };
+}
+
+// ---- 高层面：处理收到的媒体文件 ----
+
+/**
+ * 将消息中的附件下载解密并保存到本地
+ *
+ * 兼容所有媒体类型：
+ *   - 图片 (type=2): image_item
+ *   - 文件 (type=4): file_item
+ *   - 视频 (type=5): video_item
+ *
+ * @param {object} mediaItem - extractMedia() 返回的媒体项
+ * @param {string} userId - 微信用户 ID（用于文件名前缀）
+ * @param {string} destDir - 保存目录
+ * @returns {{ filepath: string, isImage: boolean, isVideo: boolean, size: number }}
+ */
+export async function processIncomingMedia(mediaItem, userId, destDir) {
+  const item = mediaItem.image_item || mediaItem.file_item || mediaItem.video_item;
+  if (!item) throw new Error(`Media item missing image_item/file_item/video_item (type=${mediaItem.type})`);
+
+  // 兼容新旧格式: 取 media 层或直顶层
+  const media = item.media || item;
+  const cdnKey = media.cdn_key || media.encrypt_query_param;
+  const aesKey = media.aes_key;
+  if (!cdnKey || !aesKey) {
+    throw new Error(`CDN data incomplete: topKeys=[${Object.keys(item)}] mediaKeys=[${Object.keys(item.media || {})}]`);
+  }
+
+  // 优先使用 full_url（含 taskid），否则自动判断 key 类型
+  const encrypted = await downloadFromCDN(media.full_url ? { fullUrl: media.full_url } : cdnKey);
+  const decrypted = decryptFileFromCDN(encrypted, aesKey);
+
+  // 根据消息类型决定扩展名
+  let ext;
+  if (mediaItem.type === 2) {
+    ext = '.jpg';  // 图片默认 jpg
+  } else if (item.file_name) {
+    ext = path.extname(item.file_name) || '.bin';
+  } else {
+    ext = '.bin';
+  }
+
+  const timestamp = Date.now();
+  const safeUser = userId.split('@')[0].replace(/[^a-zA-Z0-9_-]/g, '');
+  const filename = `${safeUser}_${timestamp}${ext}`;
+  const filepath = path.join(destDir, filename);
+
+  await fs.writeFile(filepath, decrypted);
+  return {
+    filepath,
+    isImage: mediaItem.type === 2,
+    isVideo: mediaItem.type === 5,
+    size: decrypted.length,
+  };
+}
+
+// ---- 高层面：发送文件到微信 ----
+
+async function uploadLocalMedia(toUserId, filepath, kind) {
+  const fileData = await fs.readFile(filepath);
+  const fileName = path.basename(filepath);
+  const plaintextSize = fileData.length;
+
+  console.log(chalk.dim(`  ${chalk.dim('│')}   uploading as ${kind.label}: ${fileName} (${(plaintextSize / 1024).toFixed(1)} KB)`));
+
+  const { key: aesKeyRaw } = generateAES128Key();
+  const aesKeyHex = aesKeyRaw.toString('hex');
+  const ciphertext = encryptAES128ECB(fileData, aesKeyRaw);
+  const fileKey = crypto.randomBytes(16).toString('hex');
+
+  const ilink = await getIlink();
+  const uploadResult = await ilink.getUploadUrl({
+    fileKey,
+    mediaType: kind.mediaType,
+    toUserId,
+    rawSize: plaintextSize,
+    rawFileMd5: fileMD5(fileData),
+    fileSize: ciphertext.length,
+    aesKeyHex,
+    noNeedThumb: kind.noNeedThumb,
+  });
+
+  console.log(chalk.dim(`  ${chalk.dim('│')}   getUploadUrl FULL resp:`));
+  console.log(chalk.dim(`  ${chalk.dim('│')}   ${JSON.stringify(uploadResult)}`));
+
+  const cdnUrl = buildUploadUrl(uploadResult, fileKey);
+  console.log(chalk.dim(`  ${chalk.dim('│')}   CDN URL (${cdnUrl.length} chars): ${cdnUrl}`));
+
+  const downloadParam = await uploadToCDN(uploadResult, ciphertext, { fileKey });
+  console.log(chalk.dim(`  ${chalk.dim('│')}   CDN OK, downloadParam=${downloadParam.slice(0, 40)}...`));
+
+  return {
+    fileName,
+    fileSize: plaintextSize,
+    downloadParam,
+    aesKeyBase64: Buffer.from(aesKeyHex, 'ascii').toString('base64'),
+  };
+}
+
+function buildOutgoingMediaItem(kind, uploaded) {
+  const mediaRef = {
+    encrypt_query_param: uploaded.downloadParam,
+    aes_key: uploaded.aesKeyBase64,
+    encrypt_type: 1,
+  };
+
+  const payload = { media: mediaRef };
+  if (kind.itemKey === 'file_item') {
+    payload.file_name = uploaded.fileName;
+    payload.len = String(uploaded.fileSize);
+  } else if (kind.itemKey === 'video_item') {
+    payload.file_name = uploaded.fileName;
+    payload.file_size = String(uploaded.fileSize);
+  }
+
+  return {
+    type: kind.itemType,
+    [kind.itemKey]: payload,
+  };
+}
+
+/**
+ * 将本地文件加密上传到微信 CDN 并发送给用户
+ *
+ * 自动识别文件类型，使用对应的 media_type 和消息 type：
+ *   - 图片 (.jpg/.png/.gif/.webp/...) → media_type=1, type=2 (image_item)
+ *   - 视频 (.mp4/.mov/.avi/.mkv/...)  → media_type=2, type=5 (video_item)
+ *   - 其他文件                        → media_type=3, type=4 (file_item)
+ *
+ * 协议流程：
+ *   1. 生成随机 AES-128 密钥，hex 编码传给 getUploadUrl
+ *   2. AES-128-ECB + PKCS7 填充加密文件
+ *   3. getUploadUrl 返回 upload_param（CDN 上传凭证）
+ *   4. POST 加密数据到 CDN，取响应头 x-encrypted-param 作为下载凭证
+ *   5. 通过 sendMessage 发送，aes_key = base64(hex 字符串的 ASCII 字节)
+ *
+ * @param {string} toUserId
+ * @param {string} contextToken
+ * @param {string} filepath - 本地文件绝对路径
+ */
+export async function sendFileToUser(toUserId, contextToken, filepath) {
+  const kind = detectOutgoingMediaKind(filepath);
+  const uploaded = await uploadLocalMedia(toUserId, filepath, kind);
+  const item = buildOutgoingMediaItem(kind, uploaded);
+
+  const ilink = await getIlink();
+  const sendResult = await ilink.sendMessage({ toUserId, contextToken, items: [item] });
+  console.log(chalk.dim(`  ${chalk.dim('│')}   sendMessage: ${JSON.stringify(sendResult).slice(0,100)}`));
+
+  return {
+    fileName: uploaded.fileName,
+    fileSize: uploaded.fileSize,
+    isImage: kind.isImage,
+    isVideo: kind.isVideo,
+    type: kind.label,
+  };
+}

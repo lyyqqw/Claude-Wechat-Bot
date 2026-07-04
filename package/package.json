@@ -1,0 +1,26 @@
+{
+  "name": "claude-code-wechat-bot",
+  "version": "1.0.0",
+  "description": "将 Claude Code 接入微信 ClawBot —— 基于腾讯 iLink Bot API",
+  "type": "module",
+  "bin": {
+    "claude-wechat": "./src/index.js"
+  },
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node src/index.js",
+    "login": "node src/auth.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "chalk": "^5.4.1",
+    "dotenv": "^16.4.7",
+    "qrcode": "^1.5.4"
+  }
+}
